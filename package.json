@@ -10,6 +10,7 @@
     "switch": "tsx scripts/switch.ts",
     "register": "tsx scripts/register.ts",
     "upgrade": "tsx scripts/upgrade.ts",
+    "bin": "tsx scripts/bin.ts",
     "install-browser": "npx playwright install chromium",
     "typecheck": "tsc --noEmit"
   },

@@ -34,6 +34,7 @@ export type UpgradeReason =
   | 'hydrate_failed'
   | 'google_login_failed'
   | 'no_auth_available'
+  | 'pro_status_indeterminate'
   | 'upgrade_button_not_found'
   | 'upgrade_redirect_failed'
   | 'stripe_declined'
@@ -426,6 +427,7 @@ export async function upgradeKiroAccount(
       // Indeterminate on hydrate-only auth often means the cookies are stale
       // but the server hasn't redirected to /signin yet. If we haven't tried
       // google_login yet AND we have a password, escalate.
+      let currentStatus: ProStatus = initialStatus
       if (
         initialStatus.signal === 'indeterminate' &&
         authUsed === 'hydrate' &&
@@ -463,6 +465,7 @@ export async function upgradeKiroAccount(
           })
         } catch {}
         const retryStatus = await checkProStatus(browserSession.page, log)
+        currentStatus = retryStatus
         if (retryStatus.isPro) {
           return {
             success: true,
@@ -479,13 +482,26 @@ export async function upgradeKiroAccount(
             finalProStatus: retryStatus
           }
         }
-        if (retryStatus.signal === 'indeterminate') {
-          log(
-            '[upgrade] WARN: Pro status still indeterminate after Google login — proceeding anyway'
-          )
+      }
+
+      if (!currentStatus.isPro && currentStatus.signal !== 'upgrade_present') {
+        await dumpPageState(
+          browserSession.page,
+          `${email}.pro_check_${currentStatus.signal}`,
+          log
+        )
+        return {
+          success: false,
+          email,
+          engine,
+          step: 'pro_check_initial',
+          reason: 'pro_status_indeterminate',
+          error: `could not confirm Free tier before clicking Upgrade to Pro${
+            currentStatus.detail ? ` (${currentStatus.detail})` : ''
+          }`,
+          attempts,
+          finalProStatus: currentStatus
         }
-      } else if (initialStatus.signal === 'indeterminate') {
-        log('[upgrade] WARN: could not positively identify Free tier — proceeding anyway')
       }
 
       // Step 3 — click Upgrade to Pro → Stripe checkout.

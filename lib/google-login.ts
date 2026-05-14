@@ -25,6 +25,9 @@ export type GoogleLoginResult =
   | { success: false; reason: GoogleLoginFailReason; detail?: string }
 
 const KIRO_SIGNIN_URL = 'https://app.kiro.dev/signin'
+const KIRO_SIGNIN_PATH_RE = /\/signin(?:[/?#]|$)/i
+const MAX_GOOGLE_LOGIN_ATTEMPTS = 2
+const KIRO_AUTH_COOKIE_DOMAIN_RE = /(?:^|\.)kiro\.dev$|(?:^|\.)amazoncognito\.com$/i
 
 const GOOGLE_BUTTON_LOCATORS = [
   // Kiro's /signin page (Mantine): button has unhashed `_signInButton_` class
@@ -161,12 +164,22 @@ const GOOGLE_OAUTH_CONSENT_SELECTORS = [
   'button[jsname="LgbsSe"]:has-text("Continue")',
   'button[jsname="LgbsSe"]:has-text("Allow")',
   'button[jsname="LgbsSe"]:has-text("Accept")',
+  'button[jsname="LgbsSe"]:has-text("I understand")',
   'button[jsname="LgbsSe"]:has-text("Lanjutkan")', // id
   'button[jsname="LgbsSe"]:has-text("Izinkan")',   // id
+  'button[jsname="LgbsSe"]:has-text("Setuju")',    // id
   'button:has-text("Continue")',
   'button:has-text("Allow")',
+  'button:has-text("Accept")',
+  'button:has-text("I understand")',
+  'button:has-text("Lanjutkan")',
+  'button:has-text("Izinkan")',
+  'button:has-text("Setuju")',
   'div[role="button"]:has-text("Continue")',
-  'div[role="button"]:has-text("Allow")'
+  'div[role="button"]:has-text("Allow")',
+  'div[role="button"]:has-text("Accept")',
+  'div[role="button"]:has-text("Lanjutkan")',
+  'div[role="button"]:has-text("Izinkan")'
 ]
 
 async function humanDelay(min = 120, max = 320): Promise<void> {
@@ -185,14 +198,36 @@ async function findFirstVisible(
   selectors: string[],
   timeoutMs: number
 ): Promise<string | null> {
-  const perAttempt = Math.max(500, Math.floor(timeoutMs / selectors.length))
-  for (const sel of selectors) {
-    try {
-      await page.locator(sel).first().waitFor({ state: 'visible', timeout: perAttempt })
-      return sel
-    } catch {
-      continue
+  const deadline = Date.now() + timeoutMs
+  const pollMs = Math.max(150, Math.min(500, Math.floor(timeoutMs / Math.max(selectors.length, 1))))
+
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const visibleSel = `${sel}:visible`
+      try {
+        const visible = page.locator(visibleSel).first()
+        if (await visible.isVisible({ timeout: pollMs }).catch(() => false)) {
+          return visibleSel
+        }
+      } catch {
+        // Some future selector engines may reject an appended :visible. Fall
+        // through to the original selector so a valid locator is still usable.
+      }
+
+      try {
+        const candidates = page.locator(sel)
+        const count = Math.min(await candidates.count().catch(() => 0), 8)
+        for (let i = 0; i < count; i++) {
+          const candidate = candidates.nth(i)
+          if (await candidate.isVisible({ timeout: 50 }).catch(() => false)) {
+            return `${sel} >> nth=${i}`
+          }
+        }
+      } catch {
+        continue
+      }
     }
+    await page.waitForTimeout(150)
   }
   return null
 }
@@ -206,8 +241,45 @@ async function clickFirst(
   if (!sel) return false
   try {
     await humanDelay(140, 320)
-    await page.locator(sel).first().click()
+    const target = page.locator(sel).first()
+    await target.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {})
+    await target.click({ timeout: 5000 })
     return true
+  } catch {
+    return false
+  }
+}
+
+function isKiroHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname
+    return host.endsWith('app.kiro.dev') || host === 'kiro.dev'
+  } catch {
+    return false
+  }
+}
+
+function isGoogleHost(url: string): boolean {
+  try {
+    return new URL(url).hostname.endsWith('accounts.google.com')
+  } catch {
+    return false
+  }
+}
+
+function isCognitoHost(url: string): boolean {
+  try {
+    return new URL(url).hostname.endsWith('amazoncognito.com')
+  } catch {
+    return false
+  }
+}
+
+function isGooglePasswordPage(url: string): boolean {
+  try {
+    const u = new URL(url)
+    if (!u.hostname.endsWith('accounts.google.com')) return false
+    return /\/(?:(?:v\d+\/signin)|(?:signin\/v\d+)|signin)\/challenge\/pwd\b/i.test(u.pathname)
   } catch {
     return false
   }
@@ -382,8 +454,12 @@ async function handleGoogleOAuthConsentIfPresent(
     bodyText.includes('wants access') ||
     bodyText.includes('permission') ||
     bodyText.includes('izinkan') ||
-    bodyText.includes('lanjutkan')
-  if (!isConsent) return false
+    bodyText.includes('lanjutkan') ||
+    bodyText.includes('setuju') ||
+    bodyText.includes('accept') ||
+    bodyText.includes('allow')
+  const hasConsentPath = /\/signin\/oauth\/(?:id|consent|warning)\b/i.test(url)
+  if (!isConsent && !hasConsentPath) return false
 
   log('[google-login] Google OAuth scope-consent screen detected, auto-confirming')
   // Render delay — the primary CTA is JS-instantiated on these pages.
@@ -438,14 +514,124 @@ async function handleKiroConsentIfPresent(page: Page, log: LogCallback): Promise
   } catch {}
 }
 
-export async function registerViaKiroGoogle(
+async function hasVisibleKiroSigninChoices(page: Page): Promise<boolean> {
+  return page
+    .locator(
+      [
+        'button[class*="_signInButton_"]',
+        'button:has-text("Google Sign in")',
+        'button:has-text("GitHub Sign in")',
+        'button:has-text("Builder ID Sign in")',
+        'button:has-text("Your organization Sign in")'
+      ].join(', ')
+    )
+    .first()
+    .isVisible({ timeout: 300 })
+    .catch(() => false)
+}
+
+async function hasAuthenticatedKiroShell(page: Page, email: string): Promise<boolean> {
+  const checks = [
+    page.getByText(email, { exact: false }).first(),
+    page.locator('button[class*="_accountButton_"]').first(),
+    page.locator('button:has-text("New session")').first()
+  ]
+
+  for (const locator of checks) {
+    const visible = await locator.isVisible({ timeout: 300 }).catch(() => false)
+    if (visible) return true
+  }
+  return false
+}
+
+async function validateKiroPostAuth(
   page: Page,
-  context: BrowserContext,
   email: string,
-  password: string,
   log: LogCallback
 ): Promise<GoogleLoginResult> {
-  // Step 1 — load Kiro signin page
+  const deadline = Date.now() + 20000
+  let lastUrl = page.url()
+
+  while (Date.now() < deadline) {
+    lastUrl = page.url()
+    let host = ''
+    try {
+      host = new URL(lastUrl).hostname
+    } catch {}
+
+    if (!host.endsWith('app.kiro.dev') && host !== 'kiro.dev') {
+      await page.waitForTimeout(500)
+      continue
+    }
+
+    await handleKiroConsentIfPresent(page, log)
+
+    const hasAuthShell = await hasAuthenticatedKiroShell(page, email)
+    const hasSigninChoices = await hasVisibleKiroSigninChoices(page)
+    const stillOnSignin = KIRO_SIGNIN_PATH_RE.test(lastUrl)
+
+    if (hasAuthShell) {
+      await page.waitForTimeout(1000)
+      return { success: true, finalUrl: page.url() }
+    }
+
+    if (!stillOnSignin && !hasSigninChoices) {
+      await page.waitForTimeout(1000)
+      return { success: true, finalUrl: page.url() }
+    }
+
+    await page.waitForTimeout(700)
+  }
+
+  const signinVisible = await hasVisibleKiroSigninChoices(page)
+  return {
+    success: false,
+    reason: 'kiro_postauth_failed',
+    detail: `landed on ${page.url()}${signinVisible ? ' with sign-in buttons still visible' : ''}`
+  }
+}
+
+async function clearKiroAuthState(
+  page: Page,
+  context: BrowserContext,
+  log: LogCallback
+): Promise<void> {
+  try {
+    const before = await context.cookies()
+    const matching = before.filter((cookie) =>
+      KIRO_AUTH_COOKIE_DOMAIN_RE.test(cookie.domain.replace(/^\./, '').toLowerCase())
+    )
+    if (matching.length > 0) {
+      await context.clearCookies({ domain: KIRO_AUTH_COOKIE_DOMAIN_RE })
+      log(`[google-login] cleared ${matching.length} Kiro/Cognito cookies before OAuth attempt`)
+    }
+  } catch (e) {
+    log(`[google-login] Kiro/Cognito cookie cleanup failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  try {
+    if (!isKiroHost(page.url())) return
+    await page.evaluate(() => {
+      try {
+        window.localStorage.clear()
+      } catch {}
+      try {
+        window.sessionStorage.clear()
+      } catch {}
+    })
+  } catch {
+    // Storage cleanup is best-effort. The next navigation still gets a fresh
+    // Cognito state because cookies were already pruned.
+  }
+}
+
+async function openFreshKiroSignin(
+  page: Page,
+  context: BrowserContext,
+  log: LogCallback
+): Promise<GoogleLoginResult | null> {
+  await clearKiroAuthState(page, context, log)
+
   try {
     await page.goto(KIRO_SIGNIN_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
   } catch (e) {
@@ -455,6 +641,114 @@ export async function registerViaKiroGoogle(
       detail: e instanceof Error ? e.message : String(e)
     }
   }
+
+  await clearKiroAuthState(page, context, log)
+
+  // If stale localStorage redirected the SPA during the first load, this
+  // second navigation happens after storage cleanup and gives us the real
+  // unauthenticated sign-in surface.
+  try {
+    await page.goto(KIRO_SIGNIN_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
+  } catch (e) {
+    return {
+      success: false,
+      reason: 'kiro_page_load_failed',
+      detail: e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  return null
+}
+
+function isRetryableGoogleLoginFailure(result: GoogleLoginResult): result is Extract<GoogleLoginResult, { success: false }> {
+  if (result.success) return false
+  return ![
+    'challenge_required',
+    'captcha_required',
+    'account_disabled',
+    'wrong_password',
+    'bot_detection'
+  ].includes(result.reason)
+}
+
+async function clickGoogleSigninAndWaitForOAuthStart(
+  page: Page,
+  log: LogCallback
+): Promise<GoogleLoginResult | null> {
+  const maxClickAttempts = 2
+
+  for (let attempt = 1; attempt <= maxClickAttempts; attempt++) {
+    log(
+      `[google-login] clicking Google signin on app.kiro.dev${
+        attempt > 1 ? ` (retry ${attempt}/${maxClickAttempts})` : ''
+      }`
+    )
+    const clicked = await clickFirst(page, GOOGLE_BUTTON_LOCATORS, 20000)
+    if (!clicked) {
+      return { success: false, reason: 'google_button_not_found' }
+    }
+
+    const onCognitoOrGoogle = await waitForHostChange(
+      page,
+      ['accounts.google.com', 'amazoncognito.com'],
+      attempt === 1 ? 15000 : 25000,
+      log
+    )
+    if (onCognitoOrGoogle === 'matched') return null
+    if (onCognitoOrGoogle === 'blocker') return classifyBlocker(await detectBlocker(page))
+
+    const stillOnSignin = isKiroHost(page.url()) && KIRO_SIGNIN_PATH_RE.test(page.url())
+    if (attempt < maxClickAttempts && stillOnSignin) {
+      log('[google-login] Google signin click did not start OAuth redirect, retrying click')
+      continue
+    }
+
+    return {
+      success: false,
+      reason: 'google_redirect_failed',
+      detail: `current=${page.url()}`
+    }
+  }
+
+  return {
+    success: false,
+    reason: 'google_redirect_failed',
+    detail: `current=${page.url()}`
+  }
+}
+
+async function selectGoogleAccountIfPresent(
+  page: Page,
+  email: string,
+  log: LogCallback
+): Promise<boolean> {
+  if (!isGoogleHost(page.url())) return false
+
+  const account = page.getByText(email, { exact: false }).first()
+  const visible = await account.isVisible({ timeout: 1500 }).catch(() => false)
+  if (!visible) return false
+
+  try {
+    await humanDelay(140, 320)
+    await account.click({ timeout: 5000 })
+    log('[google-login] selected existing Google session from account chooser')
+    await page.waitForTimeout(1000)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function registerViaKiroGoogleOnce(
+  page: Page,
+  context: BrowserContext,
+  email: string,
+  password: string,
+  log: LogCallback
+): Promise<GoogleLoginResult> {
+  // Step 1 — load Kiro signin page
+  const opened = await openFreshKiroSignin(page, context, log)
+  if (opened) return opened
 
   // Light pre-click warmup — some fingerprint detectors profile mouse and
   // scroll timing before the first interactive click.
@@ -468,29 +762,11 @@ export async function registerViaKiroGoogle(
     }
   } catch {}
 
-  log('[google-login] clicking Google signin on app.kiro.dev')
-  const clicked = await clickFirst(page, GOOGLE_BUTTON_LOCATORS, 20000)
-  if (!clicked) {
-    return { success: false, reason: 'google_button_not_found' }
-  }
-
   // Step 2 — wait for Google OAuth host. Kiro bounces through Cognito first,
   // then to accounts.google.com; we accept either, then re-check for the
   // real Google page on the next loop.
-  const onCognitoOrGoogle = await waitForHostChange(
-    page,
-    ['accounts.google.com', 'amazoncognito.com'],
-    20000,
-    log
-  )
-  if (onCognitoOrGoogle === 'blocker') return classifyBlocker(await detectBlocker(page))
-  if (onCognitoOrGoogle === 'timeout') {
-    return {
-      success: false,
-      reason: 'google_redirect_failed',
-      detail: `current=${page.url()}`
-    }
-  }
+  const oauthStartFailure = await clickGoogleSigninAndWaitForOAuthStart(page, log)
+  if (oauthStartFailure) return oauthStartFailure
 
   // If we landed on Cognito's intermediate page, wait for the Google redirect.
   if (!page.url().includes('accounts.google.com')) {
@@ -508,37 +784,53 @@ export async function registerViaKiroGoogle(
 
   // Step 3 — email
   const emailSel = await findFirstVisible(page, EMAIL_INPUT_LOCATORS, 15000)
-  if (!emailSel) {
+  let emailPromptCompleted = false
+  if (emailSel) {
+    try {
+      await page.locator(emailSel).first().click()
+      await humanDelay()
+      await page.locator(emailSel).first().fill('')
+      await humanDelay()
+      await typeHuman(page, email)
+    } catch (e) {
+      return { success: false, reason: 'email_input_not_found', detail: String(e) }
+    }
+
+    await humanDelay(200, 500)
+    if (!(await clickFirst(page, EMAIL_NEXT_LOCATORS, 10000))) {
+      return { success: false, reason: 'email_next_failed' }
+    }
+    emailPromptCompleted = true
+  } else if (await selectGoogleAccountIfPresent(page, email, log)) {
+    emailPromptCompleted = true
+  } else if (await handleGoogleOAuthConsentIfPresent(page, log)) {
+    log('[google-login] email prompt skipped (active Google session), continuing OAuth')
+    emailPromptCompleted = true
+  } else if (isKiroHost(page.url()) || isCognitoHost(page.url())) {
+    log('[google-login] email prompt skipped (active Google session), landed on callback')
+    emailPromptCompleted = true
+  } else {
     const blocker = await detectBlocker(page)
     if (blocker) return classifyBlocker(blocker)
     return { success: false, reason: 'email_input_not_found' }
   }
 
-  try {
-    await page.locator(emailSel).first().click()
-    await humanDelay()
-    await page.locator(emailSel).first().fill('')
-    await humanDelay()
-    await typeHuman(page, email)
-  } catch (e) {
-    return { success: false, reason: 'email_input_not_found', detail: String(e) }
-  }
-
-  await humanDelay(200, 500)
-  if (!(await clickFirst(page, EMAIL_NEXT_LOCATORS, 10000))) {
-    return { success: false, reason: 'email_next_failed' }
-  }
-
   // Step 4 — password / immediate callback / challenge
-  log('[google-login] email submitted, waiting for password prompt')
+  log(
+    `[google-login] ${
+      emailPromptCompleted ? 'email/account step completed' : 'email submitted'
+    }, waiting for password prompt`
+  )
   {
     const deadline = Date.now() + 25000
     let passwordSel: string | null = null
+    let reachedCallbackWithoutPassword = false
     while (Date.now() < deadline) {
       const host = new URL(page.url()).hostname
       if (host.includes('app.kiro.dev') || host.includes('amazoncognito.com')) {
         // Short-circuited (saved session) — skip to post-auth.
         log('[google-login] no password prompt, landed on callback')
+        reachedCallbackWithoutPassword = true
         break
       }
       if (await handleSpeedbumpIfPresent(page, log)) continue
@@ -567,8 +859,30 @@ export async function registerViaKiroGoogle(
         return { success: false, reason: 'password_next_failed' }
       }
       log('[google-login] password submitted, waiting for Kiro callback')
-    } else {
+    } else if (reachedCallbackWithoutPassword) {
       log('[google-login] password prompt skipped (active session?)')
+    } else {
+      const blocker = await detectBlocker(page)
+      if (blocker) return classifyBlocker(blocker)
+      if (isGooglePasswordPage(page.url())) {
+        return {
+          success: false,
+          reason: 'password_input_not_found',
+          detail: `password page rendered without a visible password input (${page.url()})`
+        }
+      }
+      if (isGoogleHost(page.url())) {
+        return {
+          success: false,
+          reason: 'callback_timeout',
+          detail: `stuck on Google before password entry (${page.url()})`
+        }
+      }
+      return {
+        success: false,
+        reason: 'callback_timeout',
+        detail: `password prompt did not appear before leaving Google (${page.url()})`
+      }
     }
   }
 
@@ -577,11 +891,10 @@ export async function registerViaKiroGoogle(
   while (Date.now() < deadline) {
     const host = new URL(page.url()).hostname
     if (host.endsWith('app.kiro.dev') || host === 'kiro.dev') {
-      // Final destination. Handle any Kiro-side consent.
-      await handleKiroConsentIfPresent(page, log)
-      // Give the page a beat to finalise cookies / localStorage writes.
-      await page.waitForTimeout(1500)
-      return { success: true, finalUrl: page.url() }
+      // Final destination. Validate that Kiro actually accepted the callback:
+      // app.kiro.dev/signin is the same host, but it is still an unauthenticated
+      // page and must not be treated as a successful login.
+      return validateKiroPostAuth(page, email, log)
     }
     if (await handleSpeedbumpIfPresent(page, log)) continue
     // Auto-resolve the Google OAuth scope-consent screen — fires for fresh
@@ -597,6 +910,32 @@ export async function registerViaKiroGoogle(
   const blocker = await detectBlocker(page)
   if (blocker) return classifyBlocker(blocker)
   return { success: false, reason: 'callback_timeout', detail: `last url: ${page.url()}` }
+}
+
+export async function registerViaKiroGoogle(
+  page: Page,
+  context: BrowserContext,
+  email: string,
+  password: string,
+  log: LogCallback
+): Promise<GoogleLoginResult> {
+  let lastFailure: Extract<GoogleLoginResult, { success: false }> | null = null
+
+  for (let attempt = 1; attempt <= MAX_GOOGLE_LOGIN_ATTEMPTS; attempt++) {
+    if (attempt > 1 && lastFailure) {
+      log(
+        `[google-login] retrying Google OAuth (${attempt}/${MAX_GOOGLE_LOGIN_ATTEMPTS}) after ${lastFailure.reason}`
+      )
+    }
+
+    const result = await registerViaKiroGoogleOnce(page, context, email, password, log)
+    if (result.success) return result
+
+    lastFailure = result
+    if (!isRetryableGoogleLoginFailure(result)) return result
+  }
+
+  return lastFailure ?? { success: false, reason: 'unknown' }
 }
 
 export type ExtractedTokens = {

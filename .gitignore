@@ -91,6 +91,11 @@ show/diagnostics/
 show/sessions/
 show/*.bak.*
 
+# BIN tool runtime artifacts
+show/bin-cache.json
+accounts/bin-database.json
+accounts/bin-database.csv
+
 # Playwright MCP runtime state
 .playwright-mcp/
 
@@ -98,3 +103,9 @@ show/*.bak.*
 opus-memasak-*.png
 cookies-button.png
 
+# Local debug / tmp scratch files
+error-register.txt
+log-error-upgrade-button.txt
+*.tmp-*.js
+EngganNgoding*.tmp-*.js
+AGENTS.md

@@ -47,6 +47,7 @@ npm run upgrade -- --count 5 -y
 |---------|--------|
 | `npm run register` | Bulk register akun Kiro via Google OAuth |
 | `npm run upgrade` | Upgrade akun ke Pro via Stripe checkout |
+| `npm run bin` | BIN search / finder / generator (multi-source) |
 | `npm run switch` | Legacy aor* token switcher |
 | `npm run typecheck` | TypeScript check |
 
@@ -147,6 +148,87 @@ Reset state: delete `accounts/*.state.json` atau `show/upgrade-state.json`.
 ## Disclaimer
 
 For personal automation of accounts you own. Patuhi Google Workspace TOS, Kiro TOS, dan hukum lokal.
+
+## BIN Search / Finder / Generator
+
+Multi-source BIN tool — `npm run bin` (interactive) atau subcommands:
+
+```powershell
+npm run bin                                                  # interactive menu
+npm run bin -- lookup --bin 418832                           # multi-source lookup
+npm run bin -- search --country us --scheme visa --type credit --limit 25
+npm run bin -- cascade --country "United States" --scheme VISA --bank "1ST SOURCE BANK"
+npm run bin -- generate --bin 418832 --count 10
+npm run bin -- generate --bin 418832 --count 5 --billing accounts/billing.json --append accounts/vcc.json
+npm run bin -- refresh-db
+```
+
+### Sources (priority order, earlier wins on merge)
+
+| Source | Type | Notes |
+|--------|------|-------|
+| `cache` | offline | `show/bin-cache.json`, 30-day TTL |
+| `local-db` | offline | iannuttall/binlist-data, ~343k BIN, auto-bootstrap on first run |
+| `binlist` | HTTP API | `lookup.binlist.net`, free, 5/h rate limit |
+| `bincheck` | HTTP API | `bincheck.io/api/v1.5/fectch` (DataTables), CF-warmed cookie jar |
+| `bincheck-details` | HTML scrape | `bincheck.io/details/<bin>`, no captcha |
+| `vccgenerator` | HTTP API | `/fetchdata/get-binsearch-params/` + `/get-bin-info/`, CSRF-aware |
+| `bincodes` | stealth-browser | `bincodes.com/bin-checker/`, captcha+camoufox; opt-in via `--enable-scrapers` |
+
+### Common flags
+
+```
+--json                emit machine-readable JSON
+--enable-scrapers     allow heavy browser-based sources (bincodes)
+--proxy <url>         outbound HTTP/SOCKS proxy
+--sources a,b,c       restrict source priority list
+--cache <path>        cache file (default show/bin-cache.json)
+--local-db <path>     local BIN dataset (default accounts/bin-database.json)
+--limit N             search result cap (default 50)
+```
+
+### Generator → VCC pool
+
+`generate` produces Luhn-valid PANs from a BIN prefix and writes them straight into the VCC pool the upgrade flow consumes — no manual JSON editing required.
+
+Default behavior (zero flags beyond `--bin` + `--count`):
+
+- Cards are appended to `accounts/vcc.json` (the pool `npm run upgrade` reads).
+- Each card gets a fresh randomized billing block from the country preset table, keyed off the BIN's issuer country. Indonesia BINs get Indonesian names + Jakarta/Surabaya/Bandung addresses; US BINs get US names + state/postcode pairs; etc.
+- Built-in country presets: US, ID, GB, SG, MY, AU, CA, DE, FR, JP, IN, PH, TH, BR, NL. Anything else falls back to US.
+- Duplicates (matching `id` OR identical PAN+expiry) are skipped automatically.
+
+```powershell
+# Auto-saves 10 cards to accounts/vcc.json with faked Indonesian billing
+npm run bin -- generate --bin 447242 --count 10
+
+# Override destination (writes a fresh file instead of appending)
+npm run bin -- generate --bin 447242 --count 10 --out accounts/vcc-batch1.json
+
+# Print only, do not touch the pool
+npm run bin -- generate --bin 447242 --count 10 --no-save
+```
+
+Optional shared billing — only when every card should share one cardholder + address:
+
+```powershell
+npm run bin -- generate --bin 447242 --count 10 --billing accounts/billing.json
+```
+
+Billing template shape (only used when `--billing` is passed):
+
+```json
+{
+  "name": "Cardholder Name",
+  "country": "US",
+  "line1": "123 Some St",
+  "city": "San Francisco",
+  "state": "CA",
+  "postalCode": "94105"
+}
+```
+
+Generated cards drop straight into `npm run upgrade` after the next run. No manual edit step.
 
 ## License
 

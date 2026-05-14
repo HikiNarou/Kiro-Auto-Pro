@@ -1,4 +1,4 @@
-import type { Page } from 'playwright'
+import type { Locator, Page } from 'playwright'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve, join } from 'node:path'
 
@@ -13,17 +13,11 @@ const KIRO_USAGE_URL = `${KIRO_ORIGIN}/account/usage`
  *  Free has no upgrade button; the other three each render
  *  `<button class="… _upgradeButton_… …"><span class="acme-Button-label">Upgrade to Pro[|+|Power]</span></button>`.
  *
- *  Matching the generic `_upgradeButton_` class + `.first()` is dangerous —
- *  DOM order is Pro, Pro+, Power, and `:has-text("Upgrade to Pro")` substring-
- *  matches "Upgrade to Pro+" too. We therefore pin the selector to the exact
- *  label via `text-is(...)`, with a secondary fallback that combines the stable
- *  Mantine class prefix with the exact label inside the button's inner span. */
-const UPGRADE_BUTTON_LOCATORS = [
-  'button[class*="_upgradeButton_"]:has(span.acme-Button-label >> text-is("Upgrade to Pro"))',
-  'button:has(span.acme-Button-label >> text-is("Upgrade to Pro"))',
-  'button >> text-is("Upgrade to Pro")',
-  '[role="button"] >> text-is("Upgrade to Pro")'
-]
+ *  Matching the generic `_upgradeButton_` class + `.first()` is dangerous:
+ *  DOM order is Pro, Pro+, Power, and substring matching can select
+ *  "Upgrade to Pro+". We therefore use accessible-role locators with an exact
+ *  text regex and only fall back to filtered action elements. */
+const UPGRADE_TO_PRO_TEXT_RE = /^Upgrade\s+to\s+Pro$/i
 
 /** Anchor selector for the plan cards container. When this locator becomes
  *  visible we know the usage page has finished fetching + rendering the plan
@@ -50,22 +44,40 @@ const AWS_COOKIE_BANNER_DISMISS_SELECTORS = [
   'button[data-id="awsccc-cb-btn-accept"]'
 ]
 
-async function dismissAwsCookieBanner(page: Page, log: LogCallback): Promise<boolean> {
-  const visible = await page
+async function isAwsCookieBannerVisible(page: Page): Promise<boolean> {
+  return page
     .locator(AWS_COOKIE_BANNER_SELECTOR)
     .first()
     .isVisible()
     .catch(() => false)
-  if (!visible) return false
+}
+
+async function dismissAwsCookieBanner(page: Page, log: LogCallback): Promise<boolean> {
+  if (!(await isAwsCookieBannerVisible(page))) return false
+
   for (const sel of AWS_COOKIE_BANNER_DISMISS_SELECTORS) {
     const btn = page.locator(sel).first()
     const btnVisible = await btn.isVisible().catch(() => false)
-    if (!btnVisible) continue
     try {
-      await btn.click({ timeout: 4000 })
-      log(`[pro] dismissed AWS cookie banner via ${sel}`)
-      await page.waitForTimeout(500)
-      return true
+      if (btnVisible) {
+        await btn.click({ timeout: 4000 })
+      } else {
+        const clicked = await page
+          .evaluate((selector) => {
+            const el = document.querySelector<HTMLElement>(selector)
+            if (!el) return false
+            el.click()
+            return true
+          }, sel)
+          .catch(() => false)
+        if (!clicked) continue
+      }
+
+      await page.waitForTimeout(800)
+      if (!(await isAwsCookieBannerVisible(page))) {
+        log(`[pro] dismissed AWS cookie banner via ${sel}`)
+        return true
+      }
     } catch {
       continue
     }
@@ -120,17 +132,43 @@ export type CheckProOptions = {
   pollMs?: number
 }
 
-async function firstVisibleSelector(
-  page: Page,
-  selectors: string[]
-): Promise<string | null> {
-  for (const sel of selectors) {
-    const visible = await page
-      .locator(sel)
+type LocatorMatch = {
+  locator: Locator
+  detail: string
+}
+
+function upgradeButtonCandidates(page: Page): LocatorMatch[] {
+  return [
+    {
+      locator: page.getByRole('button', { name: UPGRADE_TO_PRO_TEXT_RE }),
+      detail: 'role=button[name=/^Upgrade to Pro$/i]'
+    },
+    {
+      locator: page.getByRole('link', { name: UPGRADE_TO_PRO_TEXT_RE }),
+      detail: 'role=link[name=/^Upgrade to Pro$/i]'
+    },
+    {
+      locator: page
+        .locator('button[class*="_upgradeButton_"], a[class*="_upgradeButton_"]')
+        .filter({ hasText: UPGRADE_TO_PRO_TEXT_RE }),
+      detail: '[class*="_upgradeButton_"] filtered by exact text'
+    },
+    {
+      locator: page
+        .locator('button, a, [role="button"]')
+        .filter({ hasText: UPGRADE_TO_PRO_TEXT_RE }),
+      detail: 'action element filtered by exact text'
+    }
+  ]
+}
+
+async function firstVisibleUpgradeButton(page: Page): Promise<LocatorMatch | null> {
+  for (const candidate of upgradeButtonCandidates(page)) {
+    const visible = await candidate.locator
       .first()
       .isVisible()
       .catch(() => false)
-    if (visible) return sel
+    if (visible) return { locator: candidate.locator.first(), detail: candidate.detail }
   }
   return null
 }
@@ -264,10 +302,10 @@ export async function checkProStatus(
   while (Date.now() < deadline) {
     iteration++
 
-    const upgradeSel = await firstVisibleSelector(page, UPGRADE_BUTTON_LOCATORS)
-    if (upgradeSel) {
-      log(`[pro] found upgrade CTA via ${upgradeSel} → account is FREE`)
-      return { isPro: false, signal: 'upgrade_present', detail: upgradeSel }
+    const upgrade = await firstVisibleUpgradeButton(page)
+    if (upgrade) {
+      log(`[pro] found upgrade CTA via ${upgrade.detail} → account is FREE`)
+      return { isPro: false, signal: 'upgrade_present', detail: upgrade.detail }
     }
 
     const badge = await firstVisibleProBadge(page)
@@ -300,7 +338,7 @@ export type UpgradeClickResult =
 async function waitForUpgradeButton(
   page: Page,
   timeoutMs: number
-): Promise<string | null> {
+): Promise<LocatorMatch | null> {
   // Wait for the plan-cards container first — without it, isVisible() races
   // React and always answers false.
   for (const anchor of PLAN_CARDS_ANCHOR_SELECTORS) {
@@ -314,8 +352,8 @@ async function waitForUpgradeButton(
 
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const sel = await firstVisibleSelector(page, UPGRADE_BUTTON_LOCATORS)
-    if (sel) return sel
+    const match = await firstVisibleUpgradeButton(page)
+    if (match) return match
     await page.waitForTimeout(500)
   }
   return null
@@ -362,7 +400,7 @@ export async function dumpPageState(
           visible: boolean
         }> = []
         const els = Array.from(
-          document.querySelectorAll<HTMLElement>('button, a[role="button"], [role="button"]')
+          document.querySelectorAll<HTMLElement>('button, a, [role="button"]')
         )
         for (const el of els) {
           const rect = el.getBoundingClientRect()
@@ -432,12 +470,12 @@ export async function clickUpgradeToPro(
 
   // Resolve the upgrade button first so we don't race the click-before-visible.
   // Caller may run us before the SPA has mounted its Account header — poll.
-  const chosenSelector = await waitForUpgradeButton(page, 30000)
-  if (!chosenSelector) {
+  const chosenButton = await waitForUpgradeButton(page, 30000)
+  if (!chosenButton) {
     return { success: false, reason: 'button_not_found' }
   }
 
-  log(`[upgrade-click] clicking "${chosenSelector}"`)
+  log(`[upgrade-click] clicking "${chosenButton.detail}"`)
 
   // Arm both navigation listeners BEFORE the click. We resolve as soon as
   // either fires — a `Promise.all` here would block until BOTH settle, so a
@@ -456,7 +494,7 @@ export async function clickUpgradeToPro(
     .catch(() => null)
 
   try {
-    const target = page.locator(chosenSelector).first()
+    const target = chosenButton.locator
     await target.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {})
     // Re-verify dismissal right before the click — the banner can re-flash
     // if the SPA re-mounts it on route change.
